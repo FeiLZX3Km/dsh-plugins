@@ -585,18 +585,41 @@ window.__ModuleLoader__.load({
           for (var si3 = 0; si3 < g3.sessionIds.length; si3++) groupedMembers.add(g3.sessionIds[si3]);
         }
 
+        // 主动刷新每个可见父会话的子代理目录:runtime 默认只在聚焦/open 的父会话上
+        // 刷新目录(refreshSubagents),侧栏展示整棵会话树,若不主动调用,非聚焦父会话
+        // 的子代理不会进入 subagentsByParent → 侧栏看不到"刚拉起的子智能体"。
+        // refreshSubagents 让目录进入 ready 态;已 ready 的跳过 → 每个父会话只请求一次,
+        // refreshReq 兜底避免重复编排(会话增删后对新增父会话仍会请求)。
+        var refreshReq = react.useRef({});
+        react.useEffect(function () {
+          if (!sessionsService || typeof sessionsService.refreshSubagents !== 'function') return;
+          for (var idk of Object.keys(byId)) {
+            var sk = byId[idk];
+            if (!sk || sk.origin === 'subagent' || archived.has(idk)) continue;
+            var snap = (list && list.subagentsByParent && list.subagentsByParent[idk]);
+            if (snap && snap.state === 'ready') continue;
+            if (refreshReq.current[idk]) continue;
+            refreshReq.current[idk] = true;
+            sessionsService.refreshSubagents(idk).then(function () {}, function () {});
+          }
+        }, [list, wsState]);
+
         // parent → direct subagent children. Primary source: the runtime's own
         // per-parent subagent catalog (subagentsByParent), which tracks children
         // with their durable labels; fallback: index byId summaries by parentId,
         // gated on origin === 'subagent' so forks never appear as children.
         var childrenOf = {};
         var childLabels = {};
+        var childMeta = {}; // parentId -> [{id,label,activity}] 供排序/活动态兜底
         var catalog = (list && list.subagentsByParent) || {};
         for (var parentId of Object.keys(catalog)) {
           var c = catalog[parentId];
           var entries = (c && Array.isArray(c.entries) ? c.entries : []);
-          var kids = entries.filter(function (e) { return e && e.kind === 'child' && typeof e.id === 'string'; }).map(function (e) { return e.id; });
-          if (kids.length > 0) childrenOf[parentId] = kids;
+          var kids = entries.filter(function (e) { return e && e.kind === 'child' && typeof e.id === 'string'; });
+          if (kids.length > 0) {
+            childrenOf[parentId] = kids.map(function (e) { return e.id; });
+            childMeta[parentId] = kids.map(function (e) { return { id: e.id, label: e.label, activity: e.activity }; });
+          }
           for (var ei = 0; ei < entries.length; ei++) {
             var e0 = entries[ei];
             if (e0 && e0.kind === 'child' && typeof e0.id === 'string' && typeof e0.label === 'string' && e0.label !== '') {
@@ -612,11 +635,25 @@ window.__ModuleLoader__.load({
           }
         }
         for (var ck of Object.keys(childrenOf)) {
-          // catalog 里的 child id 可能不在 byId(已删除/对账中),排序前过滤掉,
-          // 否则 byId[a].createdAt 抛 TypeError 崩溃整个侧边栏。
-          // 归档(已释放/删除)的子代理也从展开子智能体列表里剔除,避免"删了还在"。
-          childrenOf[ck] = childrenOf[ck].filter(function (id) { return byId[id] !== undefined && !archived.has(id); });
-          childrenOf[ck].sort(function (a, b) { return (byId[a].createdAt || 0) - (byId[b].createdAt || 0); });
+          // 归档(已释放/删除)的子代理从展开子智能体列表里剔除,避免"删了还在"。
+          // 不要用 byId 是否存在来过滤——目录里的 child 可能是"仅编目"的会话
+          // (不在 sessions.list 摘要里,如已停/冷的子代理),用 byId 过滤会把
+          // 刚拉起的子代理剔除,导致侧栏不同步。
+          childrenOf[ck] = childrenOf[ck].filter(function (id) { return !archived.has(id); });
+          // 排序:优先用 byId 的 createdAt(真实时间),否则退回目录的 append 序,
+          // 用序号兜底,避免 byId[a]/byId[b] undefined 抛 TypeError 崩溃侧边栏。
+          childrenOf[ck].sort(function (a, b) {
+            var ca = byId[a] && byId[a].createdAt;
+            var cb = byId[b] && byId[b].createdAt;
+            if (typeof ca === 'number' && typeof cb === 'number') return ca - cb;
+            var meta = childMeta[ck] || [];
+            var ia = -1, ib = -1;
+            for (var mi = 0; mi < meta.length; mi++) {
+              if (meta[mi].id === a) ia = mi;
+              if (meta[mi].id === b) ib = mi;
+            }
+            return (ia === -1 ? 0 : ia) - (ib === -1 ? 0 : ib);
+          });
         }
         // subagent label → display name: strip the 'agent-teams:' prefix so a
         // member shows as its member name; other labels pass through verbatim.
@@ -629,13 +666,11 @@ window.__ModuleLoader__.load({
           if (childrenOf[p2].some(isAgentTeamsChild)) agentTeamsParents.add(p2);
         }
         function childName(cid) {
-          // 子智能体显示名:重命名后的 durable session title 优先(renameSubagent 写好);
-          // 否则用不可变的 descriptor label(准确成员名)。不要用 displayTitle——子代理
-          // 继承父 cwd,displayTitle 会是父工作区名("父会话名字"),是错误的。
-          var summary = byId[cid];
-          if (summary && typeof summary.title === 'string' && summary.title.trim() !== '') return summary.title;
+          // 子智能体名称只能来自 subagent catalog 的 descriptor label；不能读取 summary.title
+          // 或 displayTitle,因为 runtime 可能把父会话标题投影到子智能体摘要上。
+          // 没有 label 时显示 child id,绝不回退到父会话名称。
           var raw = childLabels[cid];
-          if (raw !== undefined) {
+          if (raw !== undefined && raw.trim() !== '') {
             var idx = raw.indexOf(':');
             var prefix = idx === -1 ? raw : raw.slice(0, idx);
             if (prefix === 'agent-teams') {
@@ -644,7 +679,7 @@ window.__ModuleLoader__.load({
             }
             return raw;
           }
-          return titleOf(cid);
+          return cid;
         }
 
         // ---- persistence helpers ----
@@ -1013,8 +1048,6 @@ window.__ModuleLoader__.load({
             setModal(null);
           } else if (modal.kind === 'subagent-spawn') {
             spawnSubagent(modal.id, name, modal.mode || 'new', spawnTask);
-          } else if (modal.kind === 'subagent-rename') {
-            renameSubagentHost(modal.id, name);
           }
         }
 
@@ -1070,8 +1103,6 @@ window.__ModuleLoader__.load({
             if (id === 'unhide') unhideWorkspace(m.id);
             if (id === 'remove') removeWorkspace(m.id, m.title);
           } else if (m.kind === 'subagent') {
-            if (id === 'rename-subagent') { setModal({ kind: 'subagent-rename', id: m.id, title: childName(m.id) }); setDraft(childName(m.id)); }
-            if (id === 'fork-subagent') forkSubagent(m.id, m.name || childName(m.id));
             if (id === 'end-subagent') endSubagent(m.parentId, m.id);
           } else {
             if (id === 'rename') renameSession(m.id);
@@ -1118,6 +1149,7 @@ window.__ModuleLoader__.load({
               if (res && res.ok) {
                 setModal(null);
                 window.alert('已拉起子智能体' + (res.childId ? '：' + res.childId : ''));
+                refreshParent(parentId);
               } else {
                 var errMsg = (res && res.error) || ((r && r.error && (r.error.message || r.error.code)) || '拉起失败');
                 window.alert('拉起失败：' + errMsg);
@@ -1137,6 +1169,7 @@ window.__ModuleLoader__.load({
               var res = r && r.ok ? r.value : null;
               if (res && res.ok) {
                 window.alert('已分叉复制子智能体：' + (res.name || res.childId));
+                refreshParent(sourceChildId);
               } else {
                 var errMsg = (res && res.error) || ((r && r.error && (r.error.message || r.error.code)) || '分叉复制失败');
                 window.alert('分叉复制失败：' + errMsg);
@@ -1163,12 +1196,10 @@ window.__ModuleLoader__.load({
             window.alert('重命名失败：服务不可用');
           }
         }
-        // 子代理三点菜单:重命名 / 分叉复制 / 删除(结束)
+        // 子代理三点菜单:仅保留 删除(结束)；重命名显示仍有宿主 title 同步问题,先下线。
         function subagentMenu(e, parentId, cid) {
           openMenuAt(e, {
             kind: 'subagent', id: cid, parentId: parentId, name: childName(cid), items: [
-              { id: 'rename-subagent', label: '重命名' },
-              { id: 'fork-subagent', label: '分叉复制' },
               { id: 'end-subagent', label: '删除(结束)子智能体', danger: true },
             ],
           });
@@ -1181,7 +1212,9 @@ window.__ModuleLoader__.load({
           if (p && typeof p.then === 'function') {
             p.then(function (r) {
               var res = r && r.ok ? r.value : null;
-              if (!(res && res.ok)) {
+              if (res && res.ok) {
+                refreshParent(parentId);
+              } else {
                 var errMsg = (res && res.error) || ((r && r.error && (r.error.message || r.error.code)) || '结束失败');
                 window.alert('结束失败：' + errMsg);
               }
@@ -1190,6 +1223,27 @@ window.__ModuleLoader__.load({
         }
 
         // ---- render helpers ----
+        // 主动刷新某父会话的子代理目录(拉起/分叉/结束/删除后调用),让侧栏立即同步,
+        // 不必等 runtime 只对"聚焦父会话"的刷新。清掉 refreshReq 里的请求标记,
+        // 让本次刷新不因"已请求过"而被跳过。
+        function refreshParent(parentId) {
+          delete refreshReq.current[parentId];
+          if (sessionsService && typeof sessionsService.refreshSubagents === 'function') {
+            sessionsService.refreshSubagents(parentId).then(function () {}, function () {});
+          }
+        }
+        // catalog 里每个 child 的活动态:仅编目(不在 byId)的子代理按目录 activity
+        // 判绿点;byId 已有运行的以 byId 为准。childMeta 结构与 childrenOf 同步构建。
+        function catalogActivityOf(cid) {
+          for (var pId of Object.keys(childMeta)) {
+            var meta = childMeta[pId];
+            if (!meta) continue;
+            for (var mIdx = 0; mIdx < meta.length; mIdx++) {
+              if (meta[mIdx].id === cid) return meta[mIdx].activity;
+            }
+          }
+          return undefined;
+        }
         // 子 agent 行:自身运行中(running)显示绿点,等待用户(pendingInteraction)显示黄点
         // 子代理行支持递归子代(分叉复制是源子代理的真正 fork 子代理,自然嵌套在源下)。
         function childRow(cid, parentId) {
@@ -1198,9 +1252,10 @@ window.__ModuleLoader__.load({
           var cwaiting = csummary !== undefined && csummary.pendingInteraction !== undefined && csummary.pendingInteraction !== null;
           var hasActiveChild = kids.some(function (k) {
             var s = byId[k];
-            return s !== undefined && (s.running || (s.pendingInteraction !== undefined && s.pendingInteraction !== null));
+            if (s !== undefined) return s.running || (s.pendingInteraction !== undefined && s.pendingInteraction !== null);
+            return catalogActivityOf(k) === 'running';
           });
-          var cstatusDot = cwaiting ? 'sorg-dot-wait' : (csummary && csummary.running ? 'sorg-dot-run' : (hasActiveChild ? 'sorg-dot-run' : null));
+          var cstatusDot = cwaiting ? 'sorg-dot-wait' : ((csummary && csummary.running) || catalogActivityOf(cid) === 'running' || hasActiveChild ? 'sorg-dot-run' : null);
           var childKey = 's:' + cid;
           var childOpen = expanded[childKey] === true;
           var rowEl = react.createElement('div', {
@@ -1232,7 +1287,7 @@ window.__ModuleLoader__.load({
           // 自身运行中 → 绿点;等待用户 → 黄点;否则若有任一子 agent 在活动(运行或等待)→ 绿点
           var hasActiveChild = children.some(function (c) {
             var cs = byId[c];
-            if (cs === undefined) return false;
+            if (cs === undefined) return catalogActivityOf(c) === 'running';
             if (cs.running) return true;
             return cs.pendingInteraction !== undefined && cs.pendingInteraction !== null;
           });
@@ -1459,7 +1514,6 @@ window.__ModuleLoader__.load({
           : modal.kind === 'session-delete' ? '删除会话'
           : modal.kind === 'workspace-remove' ? '移除工作区'
           : modal.kind === 'subagent-spawn' ? '拉起子智能体'
-          : modal.kind === 'subagent-rename' ? '重命名子智能体'
           : '重命名会话');
         var modalConfirmText = modal && (modal.kind === 'group-delete' || modal.kind === 'session-delete' || modal.kind === 'workspace-remove') ? '移除' : '确定';
         var modalConfirmDisabled = modal !== null && modal.kind !== 'group-delete' && modal.kind !== 'session-delete' && modal.kind !== 'workspace-remove' && draft.trim() === '';
