@@ -26,6 +26,8 @@ import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh');
 const CREDIT_TO_RMB = 0.4;
 const NEW_PRICING_MS = Date.UTC(2026, 7, 17, 0, 0, 0) - 8 * 3600e3;
+// 2026-08-23 00:00(北京)起:周末(周六/周日)全天按空闲价,不再区分峰谷。
+const WEEKEND_FREE_MS = Date.UTC(2026, 7, 23, 0, 0, 0) - 8 * 3600e3;
 const HISTORY_CAP = 500;
 
 // 仅保留当前已配置的 Relay 模型(其余模型按 DEFAULT_RELAY 兜底)
@@ -52,13 +54,29 @@ const LEGACY_RATES = {
 const SCHEME_LABELS = { old: '旧价(8/17前)', off: '空闲价', peak: '高峰价' };
 const TIER_LABELS = { flash: 'Flash 档（deepseek-*）', pro: 'Pro 档（deepseek-*-pro）' };
 
-function isPeak(now) {
+function isPeakHour(now) {
   const bj = new Date(now + 8 * 3600e3);
   const h = bj.getUTCHours();
   return (h >= 9 && h < 12) || (h >= 14 && h < 18);
 }
+/** 周末(北京时区周六/周日)全天按空闲价,不再区分峰谷(2026-08-23 00:00 起生效)。 */
+function isWeekend(now) {
+  const dow = new Date(now + 8 * 3600e3).getUTCDay();
+  return dow === 0 || dow === 6;
+}
+function isPeak(now) {
+  if (now >= WEEKEND_FREE_MS && isWeekend(now)) return false; // 周末新规
+  return isPeakHour(now);
+}
 function schemeOf(now) { return now >= NEW_PRICING_MS ? (isPeak(now) ? 'peak' : 'off') : 'old'; }
-function schemeInfo(now) { return { newPricing: now >= NEW_PRICING_MS, peak: isPeak(now), label: schemeOf(now) }; }
+function schemeInfo(now) {
+  return {
+    newPricing: now >= NEW_PRICING_MS,
+    peak: isPeak(now),
+    weekend: now >= WEEKEND_FREE_MS && isWeekend(now),
+    label: schemeOf(now),
+  };
+}
 function isLegacy(model) { return /deepseek/i.test(String(model || '')); }
 function unitOf(model, now) {
   const m = String(model || '').toLowerCase();
@@ -381,7 +399,7 @@ export default {
     ctx.sessionProjections.register({
       key: 'costSnapshot',
       stateSchema: { parse: (v) => v },
-      stateVersion: 2,
+      stateVersion: 3,
       init: initState,
       apply(state, event) {
         const entry = computeEntry(event);
@@ -441,7 +459,7 @@ export default {
           prices: {
             creditToRmb: CREDIT_TO_RMB,
             defaultRelay: DEFAULT_RELAY,
-            peakHours: '北京时间 09:00–12:00、14:00–18:00',
+            peakHours: '工作日 09:00–12:00、14:00–18:00;周末(周六日)全天空闲价(2026-08-23 起)',
             scheme: schemeInfo(now),
             relay: Object.keys(RELAY_RATES).map((model) => ({ model, ...RELAY_RATES[model] })),
             legacy: Object.keys(LEGACY_RATES).map((tier) => ({
