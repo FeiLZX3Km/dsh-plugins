@@ -114,6 +114,7 @@ window.__ModuleLoader__.load({
     var MODEL_COLORS = {
       'deepseek-v4-flash': '#3b82f6',
       'deepseek-v4-pro': '#1d4ed8',
+      'gpt-6-astra': '#ea580c',
       'gpt-5.6-sol': '#7c3aed',
       'gpt-5.6-terra': '#0891b2',
       'gpt-5.4': '#dc2626',

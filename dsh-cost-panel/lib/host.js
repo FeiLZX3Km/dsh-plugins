@@ -31,10 +31,13 @@ const WEEKEND_FREE_MS = Date.UTC(2026, 7, 23, 0, 0, 0) - 8 * 3600e3;
 const HISTORY_CAP = 500;
 
 // 仅保留当前已配置的 Relay 模型(其余模型按 DEFAULT_RELAY 兜底)
+// 价格来自中转商价目表(2026-09):输入/补全/缓存读取/缓存创建,$/1M tokens;
+// 表中为 "-" 的缓存创建价按 0 计(不单独收费)。
 const RELAY_RATES = {
-  'gpt-5.6-sol': { input: 5, output: 40, cacheRead: 0.5, cacheWrite: 5 },
+  'gpt-6-astra': { input: 10, output: 50, cacheRead: 1, cacheWrite: 1.25 },
+  'gpt-5.6-sol': { input: 5, output: 40, cacheRead: 0.5, cacheWrite: 6.25 },
   'gpt-5.6-terra': { input: 2.5, output: 20, cacheRead: 0.25, cacheWrite: 3.125 },
-  'gpt-5.4': { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 2.5 },
+  'gpt-5.4': { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
 };
 const DEFAULT_RELAY = 'gpt-5.4';
 
